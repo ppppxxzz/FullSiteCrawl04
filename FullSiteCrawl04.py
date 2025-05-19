@@ -13,38 +13,40 @@ OUTPUT_DIR = 'laws_json'
 # 日誌檔案名稱
 LOG_FILE = 'scrape.log'
 
-# 設定 Logging：同時輸出到檔案與終端
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s: %(message)s',
-    handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8'), logging.StreamHandler()]
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# 建立資料夾（支持多層）
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
-# 轉換為安全 slug（保留中文，替換非法檔名字元）
 def slugify(text):
     text = text.strip()
     text = requests.utils.unquote(text)
     for ch in '<>:"/\\|?*':
         text = text.replace(ch, '_')
-    text = text.strip(' .')
-    return text[:50] or '_'
+    return text.strip(' .')[:50] or '_'
 
-# 去除 URL 中的 fragment
 def normalize_url(url):
     p = urlparse(url)
+    # 去除 fragment (#…) 以統一 URL
     return urlunparse(p._replace(fragment=''))
 
-# 遞迴收集所有子頁面，並同時處理（邊抓邊存）
 def main():
     ensure_dir(OUTPUT_DIR)
     visited = set()
     to_visit = [normalize_url(ROOT_URL)]
     root_path = urlparse(ROOT_URL).path.rstrip('/')
+
+    # 正則：先嘗試「第 ... 條」，若無，再用「一、二、…」
+    pattern1 = re.compile(r'^第\s*.+?\s*條')          # e.g. 第 1 條
+    pattern2 = re.compile(r'^[一二三四五六七八九十]+、')  # e.g. 一、二、三、
 
     while to_visit:
         url = normalize_url(to_visit.pop())
@@ -52,6 +54,7 @@ def main():
             continue
         visited.add(url)
         logger.info(f"Fetching page: {url}")
+
         try:
             resp = requests.get(url)
             resp.raise_for_status()
@@ -60,69 +63,76 @@ def main():
             continue
 
         soup = BeautifulSoup(resp.text, 'html.parser')
+        paras = soup.select('p')
 
-        # 偵測此頁面應使用哪種分割規則：
-        # 第...條 或 一、二、 先出現者擇一
-        header_tags = ['h2','h3','h4','h5','p','div']
-        pattern_article = re.compile(r'^(?:第\s*.+?\s*條)')
-        pattern_list = re.compile(r'^[一二三四五六七八九十]+、')
-        header_pattern = None
-        # 依元素出現順序判斷
-        for tag in header_tags:
-            for elem in soup.find_all(tag):
-                txt = elem.get_text(strip=True)
-                if pattern_article.match(txt):
-                    header_pattern = pattern_article
-                    break
-                if pattern_list.match(txt):
-                    header_pattern = pattern_list
-                    break
-            if header_pattern:
-                break
-        # 若兩種都未偵測到，則使用預設雙模式
-        if not header_pattern:
-            header_pattern = re.compile(r'^(?:第\s*.+?\s*條|[一二三四五六七八九十]+、)')
+        # 先取所有「第 ... 條」
+        headings = [p for p in paras if pattern1.match(p.get_text(strip=True))]
+        # 若沒有，再取「一、二、…」
+        if not headings:
+            headings = [p for p in paras if pattern2.match(p.get_text(strip=True))]
 
-        # 提取所有法條
+        # 取 act 名稱：用 URL 最後一段 path（未 slugify）
+        path = urlparse(url).path.rstrip('/')
+        rel = path[len(root_path):]
+        segments = [requests.utils.unquote(seg) for seg in rel.split('/') if seg]
+        last = segments[-1] if segments else 'index'
+
         articles = []
-        for tag in header_tags:
-            for elem in soup.find_all(tag):
-                title = elem.get_text(strip=True)
-                if not header_pattern.match(title):
-                    continue
-                content_lines = []
-                for sib in elem.next_siblings:
-                    if hasattr(sib, 'get_text'):
-                        txt = sib.get_text(strip=True)
-                        if header_pattern.match(txt):
-                            break
-                        if txt:
-                            content_lines.append(txt)
-                content = '\n'.join(content_lines)
-                articles.append({'title': title, 'content': content})
+        seen = set()
+        for idx, elem in enumerate(headings):
+            raw_title = elem.get_text(strip=True)
+            if raw_title in seen:
+                continue
+            seen.add(raw_title)
 
-        if not articles:
-            logger.info(f"No articles found on {url}")
-        else:
-            # 計算資料夾與檔名
-            path = urlparse(url).path.rstrip('/')
-            rel = path[len(root_path):]
-            segments = [requests.utils.unquote(seg) for seg in rel.split('/') if seg]
-            dirs = segments[:-1] if segments else []
-            last = segments[-1] if segments else 'index'
-            dir_slugs = [slugify(d) for d in dirs]
-            law_slug = slugify(last)
+            # 蒐集這個標題到下一標題之間的所有文字
+            next_h = headings[idx + 1] if idx + 1 < len(headings) else None
+            body_lines = []
+            for sib in elem.next_siblings:
+                if sib == next_h:
+                    break
+                if hasattr(sib, 'get_text'):
+                    txt = sib.get_text(strip=True)
+                    if txt:
+                        body_lines.append(txt)
+            body = '\n'.join(body_lines).strip()
+
+            # 判斷標題格式
+            if pattern1.match(raw_title):
+                # 「第 ... 條」
+                article = raw_title
+                content = body
+            else:
+                # 「一、二、…」格式
+                prefix = pattern2.match(raw_title).group()  # 例如 "一、"
+                article = prefix
+                rest = raw_title[len(prefix):].strip()
+                if rest:
+                    content = rest + '\n' + body
+                else:
+                    content = body
+
+            articles.append({
+                "act": last,
+                "article": article,
+                "content": content
+            })
+
+        # 輸出 JSON
+        if articles:
+            dir_slugs = [slugify(d) for d in segments[:-1]]
             dir_path = os.path.join(OUTPUT_DIR, *dir_slugs)
             ensure_dir(dir_path)
 
-            # 單一JSON存整個法規的所有條文
-            file_name = f"{law_slug}.json"
+            file_name = slugify(last) + '.json'
             file_path = os.path.join(dir_path, file_name)
             with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump({'articles': articles}, f, ensure_ascii=False, indent=2)
-            logger.info(f"Saved regulation '{last}' with {len(articles)} articles to {file_path}")
+                json.dump(articles, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(articles)} articles for act '{last}' → {file_path}")
+        else:
+            logger.info(f"No articles extracted on {url}")
 
-        # 發現並加入子頁面
+        # 發現並加入新的子頁面連結
         for a in soup.find_all('a', href=True):
             full = urljoin(ROOT_URL, a['href'])
             norm = normalize_url(full)
